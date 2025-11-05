@@ -140,6 +140,7 @@ plot_anchors(img_np, anns, anchors)
 len(anchors), k
 
 
+# ---- Red neuronal ----
 
 def block(c_in, c_out, k=3, p=1, s=1, pk=2, ps=2):
     return torch.nn.Sequential(
@@ -207,3 +208,96 @@ class SSD(torch.nn.Module):
 net = SSD(n_classes=len(classes), k=k)
 output = net(torch.rand((64,3,100,100)))
 print(output[0].shape, output[1].shape)
+
+
+# ---- función de pérdida ----
+
+def actn_to_bb(actn, anchors, grid_size):
+    actn_bbs = torch.tanh(actn)
+    actn_p1 = anchors[:,:2] + actn_bbs[:,:2]*grid_size*0.5
+    actn_p2 = anchors[:,2:] + actn_bbs[:,2:]*grid_size*0.5
+    return torch.cat([actn_p1, actn_p2], dim=1)
+
+
+def map_to_ground_truth(overlaps):
+    prior_overlap, prior_idx = overlaps.max(1)
+    gt_overlap, gt_idx = overlaps.max(0)
+    gt_overlap[prior_idx] = 1.99
+    for i,o in enumerate(prior_idx): gt_idx[o] = i
+    return gt_overlap, gt_idx
+
+
+class SSDLoss(torch.nn.Module):
+    def __init__(self, anchors, grid_size, threshold=0.4):
+        super().__init__()
+        self.loc_loss = torch.nn.L1Loss()
+        self.class_loss = torch.nn.CrossEntropyLoss()
+        self.anchors = anchors.to(device)
+        self.grid_size = grid_size.to(device)
+        self.threshold = threshold
+
+    def forward(self, preds, target):
+        pred_bbs, pred_cs = preds 
+        tar_bbs, c_t = target # B x O x 4, B x O
+        # cada imagen del batch puede tener un número diferente de detecciones
+        loc_loss, clas_loss = 0, 0
+        for pred_bb, pred_c, tar_bb, tar_c in zip(pred_bbs, pred_cs, tar_bbs, c_t):
+            labels = torch.zeros(len(self.anchors)).long() # por defecto todas las etiquetas son `background`
+            if tar_bb.shape[0] is not 0: # es posible que haya imágenes sin detecciones
+                # calculamos el IoU de las detecciones con las cajas
+                overlaps = torchvision.ops.box_iou(tar_bb, self.anchors)
+                # nos quedamos con aquellas que coincidan
+                gt_overlap, gt_idx = map_to_ground_truth(overlaps)
+                pos = gt_overlap > self.threshold
+                # optimizamos para aquellas cajas que superen el filtro
+                pos_idx = torch.nonzero(pos)[:,0]
+                tar_idx = gt_idx[pos_idx]
+                pred_bb = actn_to_bb(pred_bb, self.anchors, self.grid_size)
+                _anchors = pred_bb[pos_idx]
+                tar_bb = tar_bb[tar_idx]
+                loc_loss += self.loc_loss(_anchors, tar_bb)
+                labels[pos_idx] = tar_c[tar_idx]
+                clas_loss += self.class_loss(pred_c, labels)
+        return clas_loss + loc_loss
+
+
+# ---- Entrenamiento ---- 
+
+def fit(model, X, target, epochs=1, lr=3e-4):
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = SSDLoss(anchors, grid_size)
+    for epoch in range(1, epochs+1):
+        model.train()
+        train_loss_loc, train_loss_cls = [], []
+        optimizer.zero_grad()
+        outputs = model(X)
+        loss = criterion(outputs, target)
+        loss.backward()
+        optimizer.step()
+        train_loss_loc.append(loss.item())
+        print(f"Epoch {epoch}/{epochs} loss {np.mean(train_loss_loc):.5f}")
+
+
+trans = A.Compose([
+    A.Resize(100, 100)
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
+
+labels, bbs = anns
+augmented = trans(**{'image': img_np, 'bboxes': bbs, 'labels': labels})
+img, bbs, labels = augmented['image'], augmented['bboxes'], augmented['labels']
+
+plot_anchors(img, (labels, bbs), anchors)
+plt.show()
+
+
+img_tensor = torch.FloatTensor(img / 255.).permute(2,0,1).unsqueeze(0).to(device)
+bb_norm = [norm(bb, img.shape[:2]) for bb in bbs]
+bb_tensor = torch.FloatTensor(bb_norm).unsqueeze(0).to(device)
+label_tensor = torch.tensor(labels).long().unsqueeze(0).to(device)
+
+print(img_tensor.shape, bb_tensor.shape, label_tensor.shape)
+
+
+model = SSD(n_classes = len(classes), k=k)
+fit(model, img_tensor, (bb_tensor, label_tensor), epochs=100)
