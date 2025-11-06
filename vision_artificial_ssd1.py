@@ -301,3 +301,43 @@ print(img_tensor.shape, bb_tensor.shape, label_tensor.shape)
 
 model = SSD(n_classes = len(classes), k=k)
 fit(model, img_tensor, (bb_tensor, label_tensor), epochs=100)
+
+
+
+# ---- Predicciones ----
+
+
+def predict(model, X):
+    model.eval()
+    with torch.no_grad():
+        X = X.to(device)
+        bbs, labels = model(X)
+        bbs = actn_to_bb(bbs[0].cpu(), anchors, grid_size)
+    return bbs, torch.max(torch.softmax(labels, axis=2)[0], axis=1)
+
+
+bbs, (scores, labels) = predict(model, img_tensor)
+bbs = [unnorm(bb, img.shape[:2]) for bb in bbs]
+
+plot_anns(img, (labels, bbs))
+plt.show()
+
+
+plot_anns(img, (labels, bbs), bg=0)
+plt.show()
+
+
+bbs, (scores, labels) = predict(model, img_tensor)
+# quitar bg
+bbs, labels, scores = bbs[labels > 0], labels[labels > 0], scores[labels > 0]
+print(bbs, labels, scores)
+
+
+nms_ixs = torchvision.ops.nms(bbs, scores, iou_threshold=0.8)
+print(nms_ixs)
+
+
+bbs, labels = bbs[nms_ixs], labels[nms_ixs]
+bbs = [unnorm(bb, img.shape[:2]) for bb in bbs]
+plot_anns(img, (labels, bbs))
+plt.show()
